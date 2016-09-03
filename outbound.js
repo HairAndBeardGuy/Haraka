@@ -38,6 +38,9 @@ var my_hostname = require('os').hostname().replace(/\\/, '\\057').replace(/:/, '
 // File Name Format: $time_$attempts_$pid_$uniq.$host
 var fn_re = /^(\d+)_(\d+)_(\d+)(_\d+\..*)$/
 
+// Line regexp
+var line_regexp = utils.line_regexp;
+
 // TODO: For testability, this should be accessible
 var queue_dir = path.resolve(config.get('queue_dir') || (process.env.HARAKA + '/queue'));
 
@@ -73,7 +76,7 @@ exports.load_config = function () {
         cfg.connect_timeout = 30;
     }
     if (cfg.pool_timeout === undefined) {
-        cfg.pool_timeout = 300;
+        cfg.pool_timeout = 50;
     }
     if (!cfg.ipv6_enabled && config.get('outbound.ipv6_enabled')) {
         cfg.ipv6_enabled = true;
@@ -497,25 +500,64 @@ exports.send_email = function () {
 
     transaction.rcpt_to = to;
 
-
     // Set data_lines to lines in contents
-    var match;
-    var re = /^([^\n]*\n?)/;
-    while (match = re.exec(contents)) {
-        var line = match[1];
-        line = line.replace(/\r?\n?$/, '\r\n'); // make sure it ends in \r\n
-        if (dot_stuffed === false && line.length >= 3 && line.substr(0,1) === '.') {
-            line = "." + line;
-        }
-        transaction.add_data(new Buffer(line));
-        contents = contents.substr(match[1].length);
-        if (contents.length === 0) {
-            break;
+    if (typeof contents == 'string') {
+        var match;
+        while (match = line_regexp.exec(contents)) {
+            var line = match[1];
+            line = line.replace(/\r?\n?$/, '\r\n'); // make sure it ends in \r\n
+            if (dot_stuffed === false && line.length >= 3 && line.substr(0,1) === '.') {
+                line = "." + line;
+            }
+            transaction.add_data(new Buffer(line));
+            contents = contents.substr(match[1].length);
+            if (contents.length === 0) {
+                break;
+            }
         }
     }
+    else {
+        // Assume a stream
+        return stream_line_reader(contents, transaction, function (err) {
+            if (err) {
+                return next(DENYSOFT, "Error from stream line reader: " + err);
+            }
+            exports.send_trans_email(transaction, next);
+        });
+    }
+
     transaction.message_stream.add_line_end();
     this.send_trans_email(transaction, next);
 };
+
+function stream_line_reader (stream, transaction, cb) {
+    var current_data = '';
+    function process_data (data) {
+        current_data += data.toString();
+        var results;
+        while (results = line_regexp.exec(current_data)) {
+            var this_line = results[1];
+            current_data = current_data.slice(this_line.length);
+            if (!(current_data.length || this_line.length)) {
+                return;
+            }
+            transaction.add_data(new Buffer(this_line));
+        }
+    };
+
+    function process_end () {
+        if (current_data.length) {
+            transaction.add_data(new Buffer(current_data));
+        }
+        current_data = '';
+        transaction.message_stream.add_line_end();
+        cb();
+    };
+
+    stream.on('data', process_data);
+    stream.once('end', process_end);
+    stream.once('error', cb);
+}
 
 exports.send_trans_email = function (transaction, next) {
     var self = this;
@@ -1151,12 +1193,16 @@ function get_pool (port, host, local_addr, is_unix_socket, connect_timeout, pool
             },
             destroy: function(socket) {
                 logger.logdebug('[outbound] destroying pool entry for ' + host + ':' + port);
-                if (!socket.writable) return;
                 // Remove pool object from server notes once empty
                 var size = pool.getPoolSize();
                 if (size === 0) {
                     delete server.notes.pool[name];
                 }
+                socket.removeAllListeners();
+                socket.once('error', function (err) {
+                    logger.logwarn("[outbound] Socket got an error while shutting down: " + err);
+                });
+                if (!socket.writable) return;
                 socket.send_command('QUIT');
                 socket.end(); // half close
                 socket.once('line', function (line) {
@@ -1212,18 +1258,19 @@ function release_client (socket, port, host, local_addr) {
     socket.__fromPool = true;
 
     socket.once('error', function (err) {
-        logger.logwarn("[outbound] Socket in pool got an error: " + err);
+        logger.logwarn("[outbound] Socket [" + name + "] in pool got an error: " + err);
         sockend();
     });
 
     socket.once('end', function () {
-        logger.logwarn("[outbound] Socket in pool got FIN");
+        logger.logwarn("[outbound] Socket [" + name + "] in pool got FIN");
         sockend();
     });
 
     pool.release(socket);
 
     function sockend () {
+        socket.removeAllListeners();
         socket.destroy();
         if (server.notes.pool[name]) {
             server.notes.pool[name].destroyAllNow();
@@ -1758,7 +1805,6 @@ HMailItem.prototype.populate_bounce_message = function (from, to, reason, cb) {
     var original_header_lines = [];
     var headers_done = false;
     var header = new Header();
-    var line_regexp = /^([^\n]*\n)/;
 
     try {
         var data_stream = this.data_stream();
