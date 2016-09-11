@@ -59,7 +59,7 @@ Haraka requires [node.js][1] to run. Install Haraka with [npm][2]:
 npm install -g Haraka
 ```
 
-After installion, use the `haraka` binary to set up the service.
+After installation, use the `haraka` binary to set up the service.
 
 ### Running Haraka
 
